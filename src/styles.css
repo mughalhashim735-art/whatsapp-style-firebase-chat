@@ -1,0 +1,363 @@
+import './styles.css';
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+  updateProfile,
+} from 'firebase/auth';
+import {
+  addDoc,
+  collection,
+  doc,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+} from 'firebase/firestore';
+import { auth, db, firebaseConfigReady } from './firebase.js';
+
+const app = document.querySelector('#app');
+let currentUser = null;
+let selectedUser = null;
+let unsubscribeMessages = null;
+let unsubscribeUsers = null;
+let users = [];
+
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function getInitials(name = '') {
+  return name
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || '')
+    .join('') || 'U';
+}
+
+function makeChatId(uid1, uid2) {
+  return [uid1, uid2].sort().join('_');
+}
+
+function formatTime(timestamp) {
+  if (!timestamp) return '';
+  const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+  return new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function renderAuth() {
+  app.innerHTML = `
+    <div class="auth-shell">
+      <div class="auth-card">
+        <div class="auth-header">
+          <div class="brand-badge">W</div>
+          <h1>Welcome to WhatsApp Clone</h1>
+          <p>Sign in to start messaging in real time</p>
+        </div>
+
+        <div class="auth-tabs">
+          <button class="tab active" data-mode="login">Login</button>
+          <button class="tab" data-mode="signup">Sign up</button>
+        </div>
+
+        <form id="auth-form" class="auth-form">
+          <div class="field hidden" id="name-field">
+            <label for="display-name">Display name</label>
+            <input id="display-name" type="text" placeholder="Your name" />
+          </div>
+
+          <div class="field">
+            <label for="email">Email</label>
+            <input id="email" type="email" placeholder="you@example.com" required />
+          </div>
+
+          <div class="field">
+            <label for="password">Password</label>
+            <input id="password" type="password" placeholder="••••••••" required />
+          </div>
+
+          <button type="submit" class="primary-btn">Continue</button>
+        </form>
+
+        <div id="auth-message" class="auth-message"></div>
+      </div>
+    </div>
+  `;
+
+  const tabs = document.querySelectorAll('.tab');
+  const form = document.querySelector('#auth-form');
+  const authMessage = document.querySelector('#auth-message');
+  const nameField = document.querySelector('#name-field');
+  let mode = 'login';
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      tabs.forEach((item) => item.classList.toggle('active', item === tab));
+      mode = tab.dataset.mode;
+      nameField.classList.toggle('hidden', mode !== 'signup');
+      authMessage.textContent = '';
+    });
+  });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    authMessage.textContent = '';
+
+    const email = document.querySelector('#email').value.trim();
+    const password = document.querySelector('#password').value.trim();
+    const displayName = document.querySelector('#display-name')?.value.trim() || '';
+
+    if (!email || !password) {
+      authMessage.textContent = 'Email and password are required.';
+      authMessage.classList.add('error');
+      return;
+    }
+
+    if (!emailRegex.test(email)) {
+      authMessage.textContent = 'Enter a valid email address.';
+      authMessage.classList.add('error');
+      return;
+    }
+
+    if (password.length < 6) {
+      authMessage.textContent = 'Password must be at least 6 characters.';
+      authMessage.classList.add('error');
+      return;
+    }
+
+    try {
+      if (mode === 'signup') {
+        const credential = await createUserWithEmailAndPassword(auth, email, password);
+        await updateProfile(credential.user, {
+          displayName: displayName || email.split('@')[0],
+        });
+
+        await setDoc(doc(db, 'users', credential.user.uid), {
+          uid: credential.user.uid,
+          email: credential.user.email,
+          name: displayName || email.split('@')[0],
+          createdAt: serverTimestamp(),
+        });
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+      }
+
+      authMessage.textContent = mode === 'signup' ? 'Account created.' : 'Signed in.';
+      authMessage.classList.remove('error');
+    } catch (error) {
+      authMessage.textContent = error.message;
+      authMessage.classList.add('error');
+    }
+  });
+
+  if (!firebaseConfigReady) {
+    authMessage.textContent = 'Add your Firebase config in src/firebase.js or .env first.';
+    authMessage.classList.add('error');
+  }
+}
+
+async function ensureSignedInUserDocument(user) {
+  if (!user) return;
+
+  const userDocRef = doc(db, 'users', user.uid);
+  const userDoc = await userDocRef.get();
+
+  if (!userDoc.exists()) {
+    await setDoc(userDocRef, {
+      uid: user.uid,
+      email: user.email,
+      name: user.displayName || user.email.split('@')[0],
+      createdAt: serverTimestamp(),
+    });
+  }
+}
+
+function renderApp() {
+  const otherUsers = users.filter((user) => user.uid !== currentUser.uid);
+
+  if (!selectedUser && otherUsers.length) {
+    selectedUser = otherUsers[0];
+  }
+
+  const selectedChatId = selectedUser
+    ? makeChatId(currentUser.uid, selectedUser.uid)
+    : null;
+
+  app.innerHTML = `
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-top">
+          <div class="profile-pill">
+            <span>${getInitials(currentUser.displayName || currentUser.email)}</span>
+          </div>
+          <div class="top-actions">
+            <button class="icon-btn" type="button" aria-label="Chat">☰</button>
+            <button class="icon-btn" id="logout-btn" type="button" aria-label="Logout">↩</button>
+          </div>
+        </div>
+
+        <div class="search-box">
+          <span>⌕</span>
+          <input type="text" placeholder="Search or start new chat" />
+        </div>
+
+        <div class="user-list">
+          ${otherUsers
+            .map(
+              (user) => `
+                <button type="button" class="user-item ${selectedUser?.uid === user.uid ? 'selected' : ''}" data-user-id="${user.uid}">
+                  <div class="avatar">${getInitials(user.name || user.email)}</div>
+                  <div class="user-text">
+                    <div class="user-row">
+                      <span class="user-name">${user.name || user.email}</span>
+                      <span class="user-time">Now</span>
+                    </div>
+                    <span class="last-message">Tap to send a message</span>
+                  </div>
+                </button>
+              `,
+            )
+            .join('') || '<div class="empty-state">No contacts yet</div>'}
+        </div>
+      </aside>
+
+      <main class="chat-panel">
+        ${selectedUser ? `
+          <header class="chat-header">
+            <div class="chat-user">
+              <div class="avatar avatar-small">${getInitials(selectedUser.name || selectedUser.email)}</div>
+              <div>
+                <div class="chat-name">${selectedUser.name || selectedUser.email}</div>
+                <div class="chat-state">online</div>
+              </div>
+            </div>
+            <div class="chat-actions">
+              <button class="icon-btn" type="button">📞</button>
+              <button class="icon-btn" type="button">⋮</button>
+            </div>
+          </header>
+
+          <div id="messages" class="messages"></div>
+
+          <form id="message-form" class="composer">
+            <button type="button" class="icon-btn emoji" aria-label="Emoji">☺</button>
+            <button type="button" class="icon-btn attach" aria-label="Attachment">＋</button>
+            <input id="message-input" type="text" placeholder="Type a message" autocomplete="off" />
+            <button class="send-btn" type="submit">➤</button>
+          </form>
+        ` : `
+          <div class="empty-chat">Select a contact to start messaging</div>
+        `}
+      </main>
+    </div>
+  `;
+
+  const logoutBtn = document.querySelector('#logout-btn');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', () => signOut(auth));
+  }
+
+  document.querySelectorAll('.user-item').forEach((button) => {
+    button.addEventListener('click', () => {
+      const targetId = button.dataset.userId;
+      const targetUser = users.find((user) => user.uid === targetId);
+      selectedUser = targetUser || null;
+      renderApp();
+    });
+  });
+
+  const messageForm = document.querySelector('#message-form');
+  if (messageForm) {
+    const messageInput = document.querySelector('#message-input');
+
+    messageForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const text = messageInput.value.trim();
+
+      if (!selectedUser || !text) return;
+
+      const chatId = makeChatId(currentUser.uid, selectedUser.uid);
+
+      await addDoc(collection(db, 'chats', chatId, 'messages'), {
+        senderId: currentUser.uid,
+        text,
+        createdAt: serverTimestamp(),
+      });
+
+      messageInput.value = '';
+      messageInput.focus();
+    });
+  }
+
+  if (selectedChatId) {
+    const messageQuery = query(
+      collection(db, 'chats', selectedChatId, 'messages'),
+      orderBy('createdAt', 'asc'),
+    );
+
+    if (unsubscribeMessages) unsubscribeMessages();
+
+    unsubscribeMessages = onSnapshot(messageQuery, (snapshot) => {
+      const messages = snapshot.docs.map((docSnapshot) => ({
+        id: docSnapshot.id,
+        ...docSnapshot.data(),
+      }));
+
+      const messagesContainer = document.querySelector('#messages');
+
+      if (!messagesContainer) return;
+
+      messagesContainer.innerHTML = messages
+        .map((message) => {
+          const isOutgoing = message.senderId === currentUser.uid;
+          return `
+            <div class="message-row ${isOutgoing ? 'outgoing' : 'incoming'}">
+              <div class="message-bubble">
+                <span>${message.text}</span>
+                <small>${formatTime(message.createdAt)}</small>
+              </div>
+            </div>
+          `;
+        })
+        .join('');
+
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    });
+  }
+}
+
+function setUsersListener() {
+  if (unsubscribeUsers) unsubscribeUsers();
+
+  unsubscribeUsers = onSnapshot(collection(db, 'users'), (snapshot) => {
+    users = snapshot.docs
+      .map((docSnapshot) => ({ id: docSnapshot.id, ...docSnapshot.data() }))
+      .filter((user) => user.uid !== currentUser?.uid);
+
+    if (selectedUser) {
+      const stillExists = users.some((user) => user.uid === selectedUser.uid);
+      if (!stillExists) selectedUser = null;
+    }
+
+    renderApp();
+  });
+}
+
+onAuthStateChanged(auth, async (user) => {
+  if (!user) {
+    currentUser = null;
+    selectedUser = null;
+    renderAuth();
+    return;
+  }
+
+  currentUser = user;
+  await ensureSignedInUserDocument(user);
+  setUsersListener();
+  renderApp();
+});
+
